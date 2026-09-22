@@ -68,8 +68,8 @@ if [[ -r /etc/os-release ]]; then
   os="$ID ${VERSION_ID:-}"
 fi
 
-body=$(printf '{"cpu":%d,"load":[%s,%s,%s],"mem":[%d,%d],"swap":[%d,%d],"disk":[%d,%d],"boot":%d,"containers":%s,"os":"%s"}' \
-  "$cpu" "$load1" "$load5" "$load15" "$mem_used" "$mem_total" "$swap_used" "$swap_total" \
+body=$(printf '{"cpu":%d,"cpus":%d,"load":[%s,%s,%s],"mem":[%d,%d],"swap":[%d,%d],"disk":[%d,%d],"boot":%d,"containers":%s,"os":"%s"}' \
+  "$cpu" "$(nproc)" "$load1" "$load5" "$load15" "$mem_used" "$mem_total" "$swap_used" "$swap_total" \
   "$disk_used" "$disk_total" "$boot" "$containers" "${os% }")
 
 if (( dry )); then
