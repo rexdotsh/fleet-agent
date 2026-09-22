@@ -1,0 +1,86 @@
+#!/usr/bin/env bash
+# Posts one sample to the workshop and exits; systemd runs it every 60s.
+# env: FLEET_HOST FLEET_KEY [FLEET_URL] [STATE_DIR]      -n: print, don't post
+set -euo pipefail
+
+dry=0
+[[ "${1:-}" == -n ]] && dry=1
+: "${FLEET_HOST:?}"
+(( dry )) || : "${FLEET_KEY:?}"
+url=${FLEET_URL:-https://rex.wf/api/fleet/ingest}
+state=${STATE_DIR:-/run/fleet-agent}/stat
+mkdir -p "${state%/*}"
+
+# cpu: jiffies diffed against the previous run, so it's the average over the interval
+read -r _ user nice system idle iowait irq softirq steal _ < /proc/stat
+busy=$((user + nice + system + irq + softirq + steal))
+total=$((busy + idle + iowait))
+cpu=0
+if read -r prev_busy prev_total 2>/dev/null < "$state" && (( total > prev_total )); then
+  cpu=$(( (busy - prev_busy) * 100 / (total - prev_total) ))
+fi
+echo "$busy $total" > "$state"
+
+while read -r key value _; do
+  case $key in
+    MemTotal:) mem_total=$value ;;
+    MemAvailable:) mem_avail=$value ;;
+    SwapTotal:) swap_total=$value ;;
+    SwapFree:) swap_free=$value ;;
+  esac
+done < /proc/meminfo
+mem_used=$(( (mem_total - mem_avail) / 1024 ))
+mem_total=$(( mem_total / 1024 ))
+swap_used=$(( (swap_total - swap_free) / 1024 ))
+swap_total=$(( swap_total / 1024 ))
+
+read -r load1 load5 load15 _ < /proc/loadavg
+read -r uptime _ < /proc/uptime
+now=$(date +%s)
+boot=$(( now - ${uptime%.*} ))
+
+read -r _ disk_total disk_used _ < <(df -kP / | tail -1)
+disk_used=$(( disk_used / 1024 ))
+disk_total=$(( disk_total / 1024 ))
+
+# every container as docker names it, with its memory; the site decides what to show.
+# FLEET_CONTAINERS=count sends only the number.
+containers='[]'
+if [[ -S /var/run/docker.sock ]]; then
+  command -v jq >/dev/null || { echo "jq is required" >&2; exit 1; }
+  docker() { curl -fsS --max-time 3 --unix-socket /var/run/docker.sock "http://d$1"; }
+  if [[ "${FLEET_CONTAINERS:-}" == count ]]; then
+    containers=$(docker /containers/json?all=1 | jq length)
+  else
+    containers=$(docker /containers/json?all=1 | jq -c '[.[] | {n: .Names[0][1:], s: .State, id: .Id}]')
+    for id in $(jq -r '.[] | select(.s == "running") | .id' <<< "$containers"); do
+      mem=$(docker "/containers/$id/stats?stream=false&one-shot=true" |
+        jq '(.memory_stats.usage - (.memory_stats.stats.inactive_file // 0)) / 1048576 | floor')
+      containers=$(jq -c --arg id "$id" --argjson m "$mem" 'map(if .id == $id then . + {m: $m} else . end)' <<< "$containers")
+    done
+    containers=$(jq -c 'map(del(.id))' <<< "$containers")
+  fi
+fi
+
+os=linux
+if [[ -r /etc/os-release ]]; then
+  . /etc/os-release
+  os="$ID ${VERSION_ID:-}"
+fi
+
+body=$(printf '{"cpu":%d,"load":[%s,%s,%s],"mem":[%d,%d],"swap":[%d,%d],"disk":[%d,%d],"boot":%d,"containers":%s,"os":"%s"}' \
+  "$cpu" "$load1" "$load5" "$load15" "$mem_used" "$mem_total" "$swap_used" "$swap_total" \
+  "$disk_used" "$disk_total" "$boot" "$containers" "${os% }")
+
+if (( dry )); then
+  echo "$body"
+  exit
+fi
+
+sig=$(printf '%s.%s' "$now" "$body" | openssl dgst -sha256 -hmac "$FLEET_KEY" | sed 's/.* //')
+curl -fsS --max-time 10 -o /dev/null -X POST "$url" \
+  -H 'content-type: application/json' \
+  -H "x-fleet-host: $FLEET_HOST" \
+  -H "x-fleet-ts: $now" \
+  -H "x-fleet-sig: $sig" \
+  --data-binary "$body"
